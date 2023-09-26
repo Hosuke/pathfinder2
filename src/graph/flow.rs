@@ -7,6 +7,43 @@ use std::collections::{BTreeMap, HashSet};
 use std::collections::{HashMap, VecDeque};
 use std::fmt::Write;
 
+/// Computes the maximum flow in a flow network using the Dinic algorithm.
+///
+/// This function iteratively constructs level graphs using Breadth-First Search (BFS) and then
+/// searches for blocking flows in these level graphs using Depth-First Search (DFS). The process
+/// continues until no augmenting paths are found in the level graph. The accumulated flow over
+/// these iterations is the maximum flow from the source to the sink.
+///
+/// # Arguments
+///
+/// * `adjacencies` - A mutable reference to the `Adjacencies` structure representing the flow network.
+/// * `source` - The source node of the flow network.
+/// * `sink` - The sink node of the flow network.
+///
+/// # Returns
+///
+/// * `U256` - The value of the maximum flow from the source to the sink in the network.
+pub fn dinic_max_flow(adjacencies: &mut Adjacencies, source: Node, sink: Node) -> U256 {
+    let mut max_flow = U256::from(0);
+
+    loop {
+        // Step 1: Build the level graph using BFS
+        let levels = match adjacencies.bfs_level_graph(&source, &sink) {
+            Some(l) => l,
+            None => break, // If no augmenting path is found, exit the loop
+        };
+
+        // Step 2: Search for blocking flows using DFS and update the residual network
+        while let Some(flow) =
+            adjacencies.dfs_search_blocking_flow(&source, &sink, &levels, U256::MAX)
+        {
+            max_flow += flow;
+        }
+    }
+
+    max_flow
+}
+
 pub fn compute_flow(
     source: &Address,
     sink: &Address,
