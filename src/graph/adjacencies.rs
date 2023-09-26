@@ -2,7 +2,7 @@ use crate::graph::Node;
 use crate::types::edge::EdgeDB;
 use crate::types::{Edge, U256};
 use std::cmp::{max, Reverse};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 
 pub struct Adjacencies<'a> {
     edges: &'a EdgeDB,
@@ -36,6 +36,90 @@ impl<'a> Adjacencies<'a> {
             lazy_adjacencies: HashMap::new(),
             capacity_adjustments: HashMap::new(),
         }
+    }
+
+    /// Uses Breadth-First Search (BFS) to construct a level graph from the source to the sink.
+    ///
+    /// This function explores the flow network and assigns a level to each node based on its distance
+    /// from the source. Nodes that are unreachable from the source in the residual network will not be
+    /// assigned a level. The level graph is used in the Dinic algorithm to find blocking flows.
+    ///
+    /// # Arguments
+    ///
+    /// * `source` - The source node of the flow network.
+    /// * `sink` - The sink node of the flow network.
+    ///
+    /// # Returns
+    ///
+    /// * `Some(HashMap<Node, usize>)` - A HashMap containing the levels of each node if there exists a path from the source to the sink.
+    /// * `None` - If no path from the source to the sink is found in the residual network.
+    pub fn bfs_level_graph(&mut self, source: &Node, sink: &Node) -> Option<HashMap<Node, usize>> {
+        let mut levels: HashMap<Node, usize> = HashMap::new(); // Initialize levels of all nodes
+        let mut queue = VecDeque::new();
+
+        levels.insert(source.clone(), 0); // Set level of source node to 0
+        queue.push_back(source.clone());
+
+        while let Some(current) = queue.pop_front() {
+            let neighbors_and_capacities = self.adjacencies_from(&current);
+            for (neighbor, capacity) in neighbors_and_capacities {
+                if !levels.contains_key(&neighbor) && capacity > U256::from(0) {
+                    levels.insert(neighbor.clone(), levels[&current] + 1);
+                    queue.push_back(neighbor);
+                }
+            }
+        }
+
+        if levels.contains_key(sink) {
+            Some(levels)
+        } else {
+            None // If the level of the sink is not found, no path from source to sink was found
+        }
+    }
+
+    /// Performs a Depth-First Search (DFS) on the level graph to find a blocking flow.
+    ///
+    /// This function searches for augmenting paths in the level graph. It ensures that we only consider
+    /// edges that go from a node to a node of a higher level. The search stops when a blocking flow is found.
+    ///
+    /// # Arguments
+    ///
+    /// * `current` - The current node being explored.
+    /// * `sink` - The sink node of the flow network.
+    /// * `levels` - A reference to a HashMap containing the levels of each node, as determined by BFS.
+    /// * `flow` - The current flow value being pushed through the path.
+    ///
+    /// # Returns
+    ///
+    /// * `Some(U256)` - The flow value of the found blocking flow.
+    /// * `None` - If no blocking flow is found from the current node to the sink.
+    pub fn dfs_search_blocking_flow(
+        &mut self,
+        current: &Node,
+        sink: &Node,
+        levels: &HashMap<Node, usize>,
+        flow: U256,
+    ) -> Option<U256> {
+        if current == sink {
+            return Some(flow);
+        }
+
+        let neighbors_and_capacities = self.adjacencies_from(current);
+        for (neighbor, capacity) in neighbors_and_capacities {
+            if levels[&neighbor] == levels[current] + 1 && capacity > U256::from(0) {
+                let new_flow = U256::min(flow, capacity);
+                if let Some(path_flow) =
+                    self.dfs_search_blocking_flow(&neighbor, sink, levels, new_flow)
+                {
+                    // Update capacities in the residual network
+                    self.adjust_capacity(current, &neighbor, -path_flow);
+                    self.adjust_capacity(&neighbor, current, path_flow);
+                    return Some(path_flow);
+                }
+            }
+        }
+
+        None
     }
 
     pub fn outgoing_edges_sorted_by_capacity(&mut self, from: &Node) -> Vec<(Node, U256)> {
