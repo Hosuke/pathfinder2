@@ -11,3 +11,8 @@ Cargo.lock
 
 # Capacity graph runtime state
 capacity_graph.db
+
+# Others added by hosuke
+edges.dat
+edges.csv
+.idea
