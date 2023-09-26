@@ -7,43 +7,25 @@ use std::collections::{BTreeMap, HashSet};
 use std::collections::{HashMap, VecDeque};
 use std::fmt::Write;
 
-/// Computes the maximum flow in a flow network using the Dinic algorithm.
+/// Computes the maximum flow between a source and a sink using Dinic's algorithm.
 ///
-/// This function iteratively constructs level graphs using Breadth-First Search (BFS) and then
-/// searches for blocking flows in these level graphs using Depth-First Search (DFS). The process
-/// continues until no augmenting paths are found in the level graph. The accumulated flow over
-/// these iterations is the maximum flow from the source to the sink.
+/// This function also considers optional constraints such as maximum distance and maximum number of transfers.
+/// After computing the flow, it extracts, simplifies, and sorts the transfers.
 ///
 /// # Arguments
 ///
-/// * `adjacencies` - A mutable reference to the `Adjacencies` structure representing the flow network.
-/// * `source` - The source node of the flow network.
-/// * `sink` - The sink node of the flow network.
+/// * `source` - The source address.
+/// * `sink` - The sink address.
+/// * `edges` - The EdgeDB containing the edges of the flow network.
+/// * `requested_flow` - The requested flow value.
+/// * `max_distance` - An optional maximum distance constraint.
+/// * `max_transfers` - An optional maximum number of transfers constraint.
 ///
 /// # Returns
 ///
-/// * `U256` - The value of the maximum flow from the source to the sink in the network.
-pub fn dinic_max_flow(adjacencies: &mut Adjacencies, source: Node, sink: Node) -> U256 {
-    let mut max_flow = U256::from(0);
-
-    loop {
-        // Step 1: Build the level graph using BFS
-        let levels = match adjacencies.bfs_level_graph(&source, &sink) {
-            Some(l) => l,
-            None => break, // If no augmenting path is found, exit the loop
-        };
-
-        // Step 2: Search for blocking flows using DFS and update the residual network
-        while let Some(flow) =
-            adjacencies.dfs_search_blocking_flow(&source, &sink, &levels, U256::MAX)
-        {
-            max_flow += flow;
-        }
-    }
-
-    max_flow
-}
-
+/// A tuple containing:
+/// * The computed flow value.
+/// * A vector of sorted edges representing the transfers.
 pub fn compute_flow(
     source: &Address,
     sink: &Address,
@@ -53,52 +35,24 @@ pub fn compute_flow(
     max_transfers: Option<u64>,
 ) -> (U256, Vec<Edge>) {
     let mut adjacencies = Adjacencies::new(edges);
-    let mut used_edges: HashMap<Node, HashMap<Node, U256>> = HashMap::new();
 
-    let mut flow = U256::default();
-    loop {
-        let (new_flow, parents) = augmenting_path(source, sink, &mut adjacencies, max_distance);
-        if new_flow == U256::default() {
-            break;
-        }
-        flow += new_flow;
-        for window in parents.windows(2) {
-            if let [node, prev] = window {
-                adjacencies.adjust_capacity(prev, node, -new_flow);
-                adjacencies.adjust_capacity(node, prev, new_flow);
-                if adjacencies.is_adjacent(node, prev) {
-                    *used_edges
-                        .entry(node.clone())
-                        .or_default()
-                        .entry(prev.clone())
-                        .or_default() -= new_flow;
-                } else {
-                    *used_edges
-                        .entry(prev.clone())
-                        .or_default()
-                        .entry(node.clone())
-                        .or_default() += new_flow;
-                }
-            } else {
-                panic!();
-            }
-        }
-    }
+    // Use Dinic's algorithm to compute the max flow and get the flow distribution
+    let (mut flow, flow_distribution) =
+        dinic_max_flow(&mut adjacencies, Node::Node(*source), Node::Node(*sink));
 
-    used_edges.retain(|_, out| {
-        out.retain(|_, c| *c != U256::from(0));
-        !out.is_empty()
-    });
+    // Update used_edges based on the flow distribution
+    let used_edges = flow_distribution;
 
     println!("Max flow: {}", flow.to_decimal());
 
     if flow > requested_flow {
-        let still_to_prune = prune_flow(source, sink, flow - requested_flow, &mut used_edges);
+        let still_to_prune =
+            prune_flow(source, sink, flow - requested_flow, &mut used_edges.clone());
         flow = requested_flow + still_to_prune;
     }
 
     if let Some(max_transfers) = max_transfers {
-        let lost = reduce_transfers(max_transfers * 3, &mut used_edges);
+        let lost = reduce_transfers(max_transfers * 3, &mut used_edges.clone());
         println!(
             "Capacity lost by transfer count reduction: {}",
             lost.to_decimal_fraction()
@@ -116,6 +70,52 @@ pub fn compute_flow(
     println!("After simplification: {}", simplified_transfers.len());
     let sorted_transfers = sort_transfers(simplified_transfers);
     (flow, sorted_transfers)
+}
+
+/// Computes the maximum flow in a flow network using Dinic's algorithm.
+///
+/// Dinic's algorithm works by repeatedly constructing level graphs using Breadth-First Search (BFS)
+/// and then searching for blocking flows in these level graphs using Depth-First Search (DFS).
+///
+/// # Arguments
+///
+/// * `adjacencies` - A mutable reference to the Adjacencies structure representing the flow network.
+/// * `source` - The source node of the flow network.
+/// * `sink` - The sink node of the flow network.
+///
+/// # Returns
+///
+/// A tuple containing:
+/// * The maximum flow value.
+/// * A HashMap representing the flow distribution across the edges.
+pub fn dinic_max_flow(
+    adjacencies: &mut Adjacencies,
+    source: Node,
+    sink: Node,
+) -> (U256, HashMap<Node, HashMap<Node, U256>>) {
+    let mut max_flow = U256::from(0);
+    let mut flow_distribution: HashMap<Node, HashMap<Node, U256>> = HashMap::new();
+
+    loop {
+        // Step 1: Build the level graph using BFS
+        let levels = match adjacencies.bfs_level_graph(&source, &sink) {
+            Some(l) => l,
+            None => break, // If no augmenting path is found, exit the loop
+        };
+
+        // Step 2: Search for blocking flows using DFS and update the residual network
+        while let Some(flow) = adjacencies.dfs_search_blocking_flow(
+            &source,
+            &sink,
+            &levels,
+            U256::MAX,
+            &mut flow_distribution,
+        ) {
+            max_flow += flow;
+        }
+    }
+
+    (max_flow, flow_distribution)
 }
 
 pub fn transfers_to_dot(edges: &Vec<Edge>) -> String {
@@ -150,42 +150,7 @@ pub fn transfers_to_dot(edges: &Vec<Edge>) -> String {
     out
 }
 
-fn augmenting_path(
-    source: &Address,
-    sink: &Address,
-    adjacencies: &mut Adjacencies,
-    max_distance: Option<u64>,
-) -> (U256, Vec<Node>) {
-    let mut parent = HashMap::new();
-    if *source == *sink {
-        return (U256::default(), vec![]);
-    }
-    let mut queue = VecDeque::<(Node, (u64, U256))>::new();
-    queue.push_back((Node::Node(*source), (0, U256::default() - U256::from(1))));
-    while let Some((node, (depth, flow))) = queue.pop_front() {
-        if let Some(max) = max_distance {
-            // * 3 because we have three edges per trust connection (two intermediate nodes).
-            if depth >= max * 3 {
-                continue;
-            }
-        }
-        for (target, capacity) in adjacencies.outgoing_edges_sorted_by_capacity(&node) {
-            if !parent.contains_key(&target) && capacity > U256::default() {
-                parent.insert(target.clone(), node.clone());
-                let new_flow = min(flow, capacity);
-                if target == Node::Node(*sink) {
-                    return (
-                        new_flow,
-                        trace(parent, &Node::Node(*source), &Node::Node(*sink)),
-                    );
-                }
-                queue.push_back((target, (depth + 1, new_flow)));
-            }
-        }
-    }
-    (U256::default(), vec![])
-}
-
+#[allow(dead_code)]
 fn trace(parent: HashMap<Node, Node>, source: &Node, sink: &Node) -> Vec<Node> {
     let mut t = vec![sink.clone()];
     let mut node = sink;

@@ -88,6 +88,7 @@ impl<'a> Adjacencies<'a> {
     /// * `sink` - The sink node of the flow network.
     /// * `levels` - A reference to a HashMap containing the levels of each node, as determined by BFS.
     /// * `flow` - The current flow value being pushed through the path.
+    /// * `flow_distribution` - A mutable reference to a HashMap tracking the flow distribution across edges.
     ///
     /// # Returns
     ///
@@ -99,6 +100,7 @@ impl<'a> Adjacencies<'a> {
         sink: &Node,
         levels: &HashMap<Node, usize>,
         flow: U256,
+        flow_distribution: &mut HashMap<Node, HashMap<Node, U256>>,
     ) -> Option<U256> {
         if current == sink {
             return Some(flow);
@@ -107,13 +109,28 @@ impl<'a> Adjacencies<'a> {
         let neighbors_and_capacities = self.adjacencies_from(current);
         for (neighbor, capacity) in neighbors_and_capacities {
             if levels[&neighbor] == levels[current] + 1 && capacity > U256::from(0) {
+                // Compute the flow for current branch
                 let new_flow = U256::min(flow, capacity);
-                if let Some(path_flow) =
-                    self.dfs_search_blocking_flow(&neighbor, sink, levels, new_flow)
-                {
+
+                // Recursive call
+                if let Some(path_flow) = self.dfs_search_blocking_flow(
+                    &neighbor,
+                    sink,
+                    levels,
+                    new_flow,
+                    flow_distribution,
+                ) {
                     // Update capacities in the residual network
                     self.adjust_capacity(current, &neighbor, -path_flow);
                     self.adjust_capacity(&neighbor, current, path_flow);
+
+                    // Update flow distribution
+                    *flow_distribution
+                        .entry(current.clone())
+                        .or_default()
+                        .entry(neighbor.clone())
+                        .or_insert(U256::from(0)) += path_flow;
+
                     return Some(path_flow);
                 }
             }
