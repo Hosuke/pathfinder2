@@ -2,7 +2,7 @@ use crate::graph::Node;
 use crate::types::edge::EdgeDB;
 use crate::types::{Edge, U256};
 use std::cmp::{max, Reverse};
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 
 pub struct Adjacencies<'a> {
     edges: &'a EdgeDB,
@@ -107,48 +107,94 @@ impl<'a> Adjacencies<'a> {
     /// * `None` - If no blocking flow is found from the current node to the sink.
     pub fn dfs_search_blocking_flow(
         &mut self,
-        current: &Node,
+        start: &Node,
         sink: &Node,
         levels: &HashMap<Node, usize>,
         flow: U256,
         flow_distribution: &mut HashMap<Node, HashMap<Node, U256>>,
     ) -> Option<U256> {
-        if current == sink {
-            return Some(flow);
+        if !levels.contains_key(sink) {
+            return None; // Exit the search when the sink is not reachable
         }
+        let mut stack = vec![(start.clone(), flow)];
+        let mut visited = HashSet::new();
 
-        let neighbors_and_capacities = self.adjacencies_from(current);
-        for (neighbor, capacity) in neighbors_and_capacities {
-            if levels[&neighbor] == levels[current] + 1 && capacity > U256::from(0) {
-                // Compute the flow for current branch
-                let new_flow = U256::min(flow, capacity);
+        while let Some((current, current_flow)) = stack.pop() {
+            if &current == sink {
+                return Some(current_flow);
+            }
 
-                // Recursive call
-                if let Some(path_flow) = self.dfs_search_blocking_flow(
-                    &neighbor,
-                    sink,
-                    levels,
-                    new_flow,
-                    flow_distribution,
-                ) {
-                    // Update capacities in the residual network
-                    self.adjust_capacity(current, &neighbor, -path_flow);
-                    self.adjust_capacity(&neighbor, current, path_flow);
+            if visited.contains(&current) {
+                continue;
+            }
+            visited.insert(current.clone());
 
-                    // Update flow distribution
+            for (neighbor, capacity) in self.adjacencies_from(&current) {
+                if levels[&neighbor] == levels[&current] + 1 && capacity > U256::from(0) {
+                    let new_flow = U256::min(current_flow, capacity);
+                    self.adjust_capacity(&current, &neighbor, -new_flow);
+                    self.adjust_capacity(&neighbor, &current, new_flow);
                     *flow_distribution
                         .entry(current.clone())
                         .or_default()
                         .entry(neighbor.clone())
-                        .or_insert(U256::from(0)) += path_flow;
-
-                    return Some(path_flow);
+                        .or_insert(U256::from(0)) += new_flow;
+                    stack.push((neighbor, new_flow));
                 }
             }
         }
 
         None
     }
+
+    // // recursive implementation
+    // pub fn dfs_search_blocking_flow(
+    //     &mut self,
+    //     current: &Node,
+    //     sink: &Node,
+    //     levels: &HashMap<Node, usize>,
+    //     flow: U256,
+    //     flow_distribution: &mut HashMap<Node, HashMap<Node, U256>>,
+    // ) -> Option<U256> {
+    //     if current == sink {
+    //         return Some(flow);
+    //     }
+    //
+    //     let neighbors_and_capacities = self.adjacencies_from(current);
+    //     for (neighbor, capacity) in neighbors_and_capacities {
+    //         if levels[&neighbor] == levels[current] + 1 && capacity > U256::from(0) {
+    //             // Compute the flow for current branch
+    //             let new_flow = U256::min(flow, capacity);
+    //
+    //             // Recursive call
+    //             if let Some(path_flow) = self.dfs_search_blocking_flow(
+    //                 &neighbor,
+    //                 sink,
+    //                 &levels,
+    //                 new_flow,
+    //                 flow_distribution,
+    //             ) {
+    //                 // Update capacities in the residual network
+    //                 self.adjust_capacity(current, &neighbor, -path_flow);
+    //                 self.adjust_capacity(&neighbor, current, path_flow);
+    //
+    //                 // Update flow distribution
+    //                 *flow_distribution
+    //                     .entry(current.clone())
+    //                     .or_default()
+    //                     .entry(neighbor.clone())
+    //                     .or_insert(U256::from(0)) += path_flow;
+    //
+    //                 return Some(path_flow);
+    //             } else {
+    //                 // If no blocking flow is found along this edge, set its capacity to 0
+    //                 self.adjust_capacity(current, &neighbor, -capacity);
+    //                 self.adjust_capacity(&neighbor, current, capacity);
+    //             }
+    //         }
+    //     }
+    //     None
+    // }
 
     #[allow(dead_code)]
     pub fn outgoing_edges_sorted_by_capacity(&mut self, from: &Node) -> Vec<(Node, U256)> {
@@ -186,18 +232,19 @@ impl<'a> Adjacencies<'a> {
         }
     }
 
-    fn adjacencies_from(&mut self, from: &Node) -> HashMap<Node, U256> {
-        self.lazy_adjacencies
+    pub fn adjacencies_from(&mut self, from: &Node) -> HashMap<Node, U256> {
+        let result = self
+            .lazy_adjacencies
             .entry(from.clone())
             .or_insert_with(|| {
-                let mut result: HashMap<Node, U256> = HashMap::new();
+                let mut computed_adjacencies: HashMap<Node, U256> = HashMap::new();
                 // Plain edges are (from, to, token) labeled with capacity
                 match from {
                     Node::Node(from) => {
                         for edge in self.edges.outgoing(from) {
                             // One edge from "from" to "from x token" with a capacity
                             // as the max over all "to" addresses (the balance of the sender)
-                            result
+                            computed_adjacencies
                                 .entry(balance_node(edge))
                                 .and_modify(|c| {
                                     if edge.capacity > *c {
@@ -211,7 +258,7 @@ impl<'a> Adjacencies<'a> {
                         for edge in self.edges.outgoing(from) {
                             // The actual capacity of the edge / the send limit.
                             if edge.from == *from && edge.token == *token {
-                                result.insert(trust_node(edge), edge.capacity);
+                                computed_adjacencies.insert(trust_node(edge), edge.capacity);
                             }
                         }
                     }
@@ -228,12 +275,26 @@ impl<'a> Adjacencies<'a> {
                                     capacity = max(capacity, edge.capacity)
                                 }
                             }
-                            result.insert(Node::Node(*to), capacity);
+                            computed_adjacencies.insert(Node::Node(*to), capacity);
                         }
                     }
                 }
-                result
+                computed_adjacencies
             })
-            .clone()
+            .clone();
+
+        // Thinking of capacity adjustment
+        let mut adjusted_result = result.clone();
+        for (neighbor, capacity) in adjusted_result.iter_mut() {
+            if let Some(adjustment) = self
+                .capacity_adjustments
+                .get(from)
+                .and_then(|m| m.get(neighbor))
+            {
+                *capacity += *adjustment;
+            }
+        }
+
+        adjusted_result
     }
 }
