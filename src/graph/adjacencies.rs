@@ -48,12 +48,18 @@ impl<'a> Adjacencies<'a> {
     ///
     /// * `source` - The source node of the flow network.
     /// * `sink` - The sink node of the flow network.
+    /// * `max_distance` - An optional maximum distance constraint.
     ///
     /// # Returns
     ///
     /// * `Some(HashMap<Node, usize>)` - A HashMap containing the levels of each node if there exists a path from the source to the sink.
     /// * `None` - If no path from the source to the sink is found in the residual network.
-    pub fn bfs_level_graph(&mut self, source: &Node, sink: &Node) -> Option<HashMap<Node, usize>> {
+    pub fn bfs_level_graph(
+        &mut self,
+        source: &Node,
+        sink: &Node,
+        max_distance: Option<u64>,
+    ) -> Option<HashMap<Node, usize>> {
         let mut levels: HashMap<Node, usize> = HashMap::new(); // Initialize levels of all nodes
         let mut queue = VecDeque::new();
 
@@ -61,6 +67,11 @@ impl<'a> Adjacencies<'a> {
         queue.push_back(source.clone());
 
         while let Some(current) = queue.pop_front() {
+            if let Some(max_dist) = max_distance {
+                if levels[&current] >= max_dist as usize {
+                    continue; // Skip exploring neighbors if current distance exceeds max_distance
+                }
+            }
             let neighbors_and_capacities = self.adjacencies_from(&current);
             for (neighbor, capacity) in neighbors_and_capacities {
                 if !levels.contains_key(&neighbor) && capacity > U256::from(0) {
@@ -139,6 +150,7 @@ impl<'a> Adjacencies<'a> {
         None
     }
 
+    #[allow(dead_code)]
     pub fn outgoing_edges_sorted_by_capacity(&mut self, from: &Node) -> Vec<(Node, U256)> {
         let mut adjacencies = self.adjacencies_from(from);
         if let Some(adjustments) = self.capacity_adjustments.get(from) {
@@ -164,6 +176,7 @@ impl<'a> Adjacencies<'a> {
     }
 
     #[allow(clippy::wrong_self_convention)]
+    #[allow(dead_code)]
     pub fn is_adjacent(&mut self, from: &Node, to: &Node) -> bool {
         // TODO More efficiently?
         if let Some(capacity) = self.adjacencies_from(from).get(to) {

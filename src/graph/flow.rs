@@ -37,8 +37,12 @@ pub fn compute_flow(
     let mut adjacencies = Adjacencies::new(edges);
 
     // Use Dinic's algorithm to compute the max flow and get the flow distribution
-    let (mut flow, flow_distribution) =
-        dinic_max_flow(&mut adjacencies, Node::Node(*source), Node::Node(*sink));
+    let (mut flow, flow_distribution) = dinic_max_flow(
+        &mut adjacencies,
+        Node::Node(*source),
+        Node::Node(*sink),
+        max_distance,
+    );
 
     // Update used_edges based on the flow distribution
     let used_edges = flow_distribution;
@@ -82,6 +86,7 @@ pub fn compute_flow(
 /// * `adjacencies` - A mutable reference to the Adjacencies structure representing the flow network.
 /// * `source` - The source node of the flow network.
 /// * `sink` - The sink node of the flow network.
+/// * `max_distance` - An optional maximum distance constraint.
 ///
 /// # Returns
 ///
@@ -92,13 +97,14 @@ pub fn dinic_max_flow(
     adjacencies: &mut Adjacencies,
     source: Node,
     sink: Node,
+    max_distance: Option<u64>,
 ) -> (U256, HashMap<Node, HashMap<Node, U256>>) {
     let mut max_flow = U256::from(0);
     let mut flow_distribution: HashMap<Node, HashMap<Node, U256>> = HashMap::new();
 
     loop {
         // Step 1: Build the level graph using BFS
-        let levels = match adjacencies.bfs_level_graph(&source, &sink) {
+        let levels = match adjacencies.bfs_level_graph(&source, &sink, max_distance) {
             Some(l) => l,
             None => break, // If no augmenting path is found, exit the loop
         };
