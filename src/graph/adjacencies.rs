@@ -1,6 +1,7 @@
 use crate::graph::Node;
 use crate::types::edge::EdgeDB;
 use crate::types::U256;
+use std::cmp::min;
 use std::collections::{HashMap, VecDeque};
 
 pub struct Adjacencies<'a> {
@@ -65,63 +66,84 @@ impl<'a> Adjacencies<'a> {
     }
 
     /// Build a level graph using BFS.
-    pub fn bfs(&mut self, source: &Node<'a>, target: &Node<'a>) -> bool {
-        self.level.clear();
-        self.level.insert(source.clone(), 0);
+    fn bfs(
+        &self,
+        source: &Node,
+        sink: &Node,
+        max_distance: Option<u64>,
+    ) -> HashMap<Node<'a>, usize> {
+        let mut level = HashMap::new();
         let mut queue = VecDeque::new();
+        level.insert(source.clone(), 0);
         queue.push_back(source.clone());
 
-        while !queue.is_empty() {
-            let current = queue.pop_front().unwrap();
-            for (neighbor, _) in self.outgoing_edges_sorted_by_capacity(&current) {
-                if !self.level.contains_key(&neighbor) && self.is_adjacent(&current, &neighbor) {
-                    self.level
-                        .insert(neighbor.clone(), self.level[&current] + 1);
-                    queue.push_back(neighbor);
+        while let Some(node) = queue.pop_front() {
+            if let Some(max) = max_distance {
+                if level[&node] >= max as usize {
+                    continue;
+                }
+            }
+
+            for (next, &capacity) in self.edges[&node].iter() {
+                if capacity > U256::from(0) && !level.contains_key(next) {
+                    level.insert(next.clone(), level[&node] + 1);
+                    queue.push_back(next.clone());
                 }
             }
         }
 
-        self.level.contains_key(target)
+        level
     }
 
     /// Find an augmenting path using DFS.
-    pub fn dfs(&mut self, node: &Node<'a>, target: &Node<'a>, flow: U256) -> U256 {
-        if node == target {
+    fn dfs(
+        &mut self,
+        node: &Node,
+        sink: &Node,
+        flow: U256,
+        level: &HashMap<Node<'a>, usize>,
+    ) -> U256 {
+        if node == sink {
             return flow;
         }
 
-        while let Some(&(neighbor, capacity)) = self
-            .outgoing_edges_sorted_by_capacity(node)
-            .get(self.ptr[&node])
-        {
-            if self.level[&neighbor] == self.level[node] + 1 && capacity > U256::from(0) {
-                let current_flow = self.dfs(&neighbor, target, std::cmp::min(flow, capacity));
-                if current_flow > U256::from(0) {
-                    self.adjust_capacity(node, &neighbor, -current_flow);
-                    self.adjust_capacity(&neighbor, node, current_flow);
-                    return current_flow;
+        for (next, capacity) in self.edges[node].iter_mut() {
+            if *capacity > U256::from(0) && level[node] + 1 == level[next] {
+                let current_flow = min(flow, *capacity);
+                let temp_flow = self.dfs(next, sink, current_flow, level);
+                if temp_flow > U256::from(0) {
+                    *capacity -= temp_flow;
+                    if let Some(reverse_capacity) = self.edges[next].get_mut(node) {
+                        *reverse_capacity += temp_flow;
+                    } else {
+                        self.edges[next].insert(node.clone(), temp_flow);
+                    }
+                    return temp_flow;
                 }
             }
-            self.ptr.insert(node.clone(), self.ptr[&node] + 1);
         }
 
         U256::from(0)
     }
 
     /// Main function for the Dinic algorithm.
-    pub fn dinic_max_flow(&mut self, source: &Node<'a>, target: &Node<'a>) -> U256 {
+    pub fn dinic_max_flow(
+        &mut self,
+        source: &Node<'a>,
+        target: &Node<'a>,
+        max_distance: Option<u64>,
+    ) -> U256 {
         let mut max_flow = U256::from(0);
-        while self.bfs(source, target) {
+        while let level = self.bfs(source, target, max_distance) {
             self.ptr.clear();
             for node in self.edges.keys() {
                 self.ptr.insert(node.clone(), 0);
             }
 
-            let mut flow = self.dfs(source, target, U256::MAX);
+            let mut flow = self.dfs(source, target, U256::MAX, &level);
             while flow != U256::from(0) {
                 max_flow += flow;
-                flow = self.dfs(source, target, U256::MAX);
+                flow = self.dfs(source, target, U256::MAX, &level);
             }
         }
 
