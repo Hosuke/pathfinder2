@@ -1,125 +1,130 @@
 use crate::graph::Node;
 use crate::types::edge::EdgeDB;
-use crate::types::{Edge, U256};
-use std::cmp::{max, Reverse};
-use std::collections::HashMap;
+use crate::types::U256;
+use std::collections::{HashMap, VecDeque};
 
 pub struct Adjacencies<'a> {
-    edges: &'a EdgeDB,
-    lazy_adjacencies: HashMap<Node, HashMap<Node, U256>>,
-    capacity_adjustments: HashMap<Node, HashMap<Node, U256>>,
+    edges: HashMap<Node<'a>, HashMap<Node<'a>, U256>>,
+    level: HashMap<Node<'a>, usize>,
+    ptr: HashMap<Node<'a>, usize>,
 }
-
-// fn pseudo_node(edge: Edge) -> Node {
-//     Node::TokenEdge(edge.from, edge.token)
-// }
-
-fn balance_node(edge: &Edge) -> Node {
-    Node::BalanceNode(edge.from, edge.token)
-}
-
-fn trust_node(edge: &Edge) -> Node {
-    Node::TrustNode(edge.to, edge.token)
-}
-
-// fn source_address_of(node: &Node) -> &Address {
-//     match node {
-//         Node::Node(addr) => addr,
-//         Node::TokenEdge(from, _) => from,
-//     }
-// }
 
 impl<'a> Adjacencies<'a> {
-    pub fn new(edges: &'a EdgeDB) -> Self {
-        Adjacencies {
-            edges,
-            lazy_adjacencies: HashMap::new(),
-            capacity_adjustments: HashMap::new(),
+    /// Create a new Adjacencies structure from the given EdgeDB.
+    pub fn new(edges: &EdgeDB<'a>) -> Self {
+        let mut adjacencies = Adjacencies {
+            edges: HashMap::new(),
+            level: HashMap::new(),
+            ptr: HashMap::new(),
+        };
+
+        // Initialization code: Populate the edges based on the EdgeDB.
+        // For each edge in the EdgeDB, extract the 'from' and 'to' nodes and the capacity.
+        // Then, update the 'edges' HashMap in the Adjacencies structure.
+        for edge in edges.iter() {
+            adjacencies
+                .edges
+                .entry(edge.from.clone())
+                .or_default()
+                .insert(edge.to.clone(), edge.capacity);
         }
+
+        adjacencies
     }
 
-    pub fn outgoing_edges_sorted_by_capacity(&mut self, from: &Node) -> Vec<(Node, U256)> {
-        let mut adjacencies = self.adjacencies_from(from);
-        if let Some(adjustments) = self.capacity_adjustments.get(from) {
-            for (node, c) in adjustments {
-                *adjacencies.entry(node.clone()).or_default() += *c;
+    /// Get all outgoing edges from a node, sorted by their capacity.
+    pub fn outgoing_edges_sorted_by_capacity(&self, node: &Node<'a>) -> Vec<(Node<'a>, U256)> {
+        let mut edges: Vec<_> = self
+            .edges
+            .get(node)
+            .unwrap_or(&HashMap::new())
+            .clone()
+            .into_iter()
+            .collect();
+        edges.sort_by_key(|(_, capacity)| *capacity);
+        edges.reverse();
+        edges
+    }
+
+    /// Adjust the capacity between two nodes by a given amount.
+    pub fn adjust_capacity(&mut self, from: &Node<'a>, to: &Node<'a>, amount: U256) {
+        if let Some(outgoing) = self.edges.get_mut(from) {
+            if let Some(capacity) = outgoing.get_mut(to) {
+                *capacity += amount;
             }
         }
-        let mut result = adjacencies
-            .into_iter()
-            .filter(|(_, cap)| *cap != U256::from(0))
-            .collect::<Vec<(Node, U256)>>();
-        result.sort_unstable_by_key(|(addr, capacity)| (Reverse(*capacity), addr.clone()));
-        result
     }
 
-    pub fn adjust_capacity(&mut self, from: &Node, to: &Node, adjustment: U256) {
-        *self
-            .capacity_adjustments
-            .entry(from.clone())
-            .or_default()
-            .entry(to.clone())
-            .or_default() += adjustment;
-    }
-
-    #[allow(clippy::wrong_self_convention)]
-    pub fn is_adjacent(&mut self, from: &Node, to: &Node) -> bool {
-        // TODO More efficiently?
-        if let Some(capacity) = self.adjacencies_from(from).get(to) {
-            *capacity > U256::from(0)
+    /// Check if two nodes are adjacent.
+    pub fn is_adjacent(&self, from: &Node<'a>, to: &Node<'a>) -> bool {
+        if let Some(outgoing) = self.edges.get(from) {
+            outgoing.contains_key(to)
         } else {
             false
         }
     }
 
-    fn adjacencies_from(&mut self, from: &Node) -> HashMap<Node, U256> {
-        self.lazy_adjacencies
-            .entry(from.clone())
-            .or_insert_with(|| {
-                let mut result: HashMap<Node, U256> = HashMap::new();
-                // Plain edges are (from, to, token) labeled with capacity
-                match from {
-                    Node::Node(from) => {
-                        for edge in self.edges.outgoing(from) {
-                            // One edge from "from" to "from x token" with a capacity
-                            // as the max over all "to" addresses (the balance of the sender)
-                            result
-                                .entry(balance_node(edge))
-                                .and_modify(|c| {
-                                    if edge.capacity > *c {
-                                        *c = edge.capacity;
-                                    }
-                                })
-                                .or_insert(edge.capacity);
-                        }
-                    }
-                    Node::BalanceNode(from, token) => {
-                        for edge in self.edges.outgoing(from) {
-                            // The actual capacity of the edge / the send limit.
-                            if edge.from == *from && edge.token == *token {
-                                result.insert(trust_node(edge), edge.capacity);
-                            }
-                        }
-                    }
-                    Node::TrustNode(to, token) => {
-                        let is_return_to_owner = *to == *token;
-                        // If token is to's token: send back to owner, infinite capacity.
-                        // Otherwise, the max of the incoming edges (the trust limit)
-                        let mut capacity = U256::from(0);
-                        for edge in self.edges.incoming(to) {
-                            if edge.token == *token {
-                                if is_return_to_owner {
-                                    capacity += edge.capacity
-                                } else {
-                                    capacity = max(capacity, edge.capacity)
-                                }
-                            }
-                            result.insert(Node::Node(*to), capacity);
-                        }
-                    }
+    /// Build a level graph using BFS.
+    pub fn bfs(&mut self, source: &Node<'a>, target: &Node<'a>) -> bool {
+        self.level.clear();
+        self.level.insert(source.clone(), 0);
+        let mut queue = VecDeque::new();
+        queue.push_back(source.clone());
+
+        while !queue.is_empty() {
+            let current = queue.pop_front().unwrap();
+            for (neighbor, _) in self.outgoing_edges_sorted_by_capacity(&current) {
+                if !self.level.contains_key(&neighbor) && self.is_adjacent(&current, &neighbor) {
+                    self.level
+                        .insert(neighbor.clone(), self.level[&current] + 1);
+                    queue.push_back(neighbor);
                 }
-                result
-            })
-            .clone()
+            }
+        }
+
+        self.level.contains_key(target)
+    }
+
+    /// Find an augmenting path using DFS.
+    pub fn dfs(&mut self, node: &Node<'a>, target: &Node<'a>, flow: U256) -> U256 {
+        if node == target {
+            return flow;
+        }
+
+        while let Some(&(neighbor, capacity)) = self
+            .outgoing_edges_sorted_by_capacity(node)
+            .get(self.ptr[&node])
+        {
+            if self.level[&neighbor] == self.level[node] + 1 && capacity > U256::from(0) {
+                let current_flow = self.dfs(&neighbor, target, std::cmp::min(flow, capacity));
+                if current_flow > U256::from(0) {
+                    self.adjust_capacity(node, &neighbor, -current_flow);
+                    self.adjust_capacity(&neighbor, node, current_flow);
+                    return current_flow;
+                }
+            }
+            self.ptr.insert(node.clone(), self.ptr[&node] + 1);
+        }
+
+        U256::from(0)
+    }
+
+    /// Main function for the Dinic algorithm.
+    pub fn dinic_max_flow(&mut self, source: &Node<'a>, target: &Node<'a>) -> U256 {
+        let mut max_flow = U256::from(0);
+        while self.bfs(source, target) {
+            self.ptr.clear();
+            for node in self.edges.keys() {
+                self.ptr.insert(node.clone(), 0);
+            }
+
+            let mut flow = self.dfs(source, target, U256::MAX);
+            while flow != U256::from(0) {
+                max_flow += flow;
+                flow = self.dfs(source, target, U256::MAX);
+            }
+        }
+
+        max_flow
     }
 }
