@@ -7,57 +7,52 @@ use std::collections::{BTreeMap, HashSet};
 use std::collections::{HashMap, VecDeque};
 use std::fmt::Write;
 
-pub fn compute_flow(
+pub fn compute_flow<'a>(
     source: &Address,
     sink: &Address,
-    edges: &EdgeDB,
+    edges: &EdgeDB<'a>,
     requested_flow: U256,
     max_distance: Option<u64>,
     max_transfers: Option<u64>,
-) -> (U256, Vec<Edge>) {
+) -> (U256, Vec<Edge<'a>>) {
     let mut adjacencies = Adjacencies::new(edges);
-    let mut used_edges: HashMap<Node, HashMap<Node, U256>> = HashMap::new();
+    let source_node = Node::BalanceNode(source);
+    let sink_node = Node::BalanceNode(sink);
 
-    let mut flow = U256::default();
-    loop {
-        let (new_flow, parents) = augmenting_path(source, sink, &mut adjacencies, max_distance);
-        if new_flow == U256::default() {
-            break;
-        }
-        flow += new_flow;
-        for window in parents.windows(2) {
-            if let [node, prev] = window {
-                adjacencies.adjust_capacity(prev, node, -new_flow);
-                adjacencies.adjust_capacity(node, prev, new_flow);
-                if adjacencies.is_adjacent(node, prev) {
-                    *used_edges
-                        .entry(node.clone())
-                        .or_default()
-                        .entry(prev.clone())
-                        .or_default() -= new_flow;
-                } else {
-                    *used_edges
-                        .entry(prev.clone())
-                        .or_default()
-                        .entry(node.clone())
-                        .or_default() += new_flow;
+    // Step 1: Compute the maximum flow using Dinic's algorithm
+    let mut max_flow = adjacencies.dinic_max_flow(&source_node, &sink_node, max_distance);
+
+    println!("Computed max flow: {}", max_flow);
+
+    // Step 2: Extract the used edges based on the flow
+    let mut used_edges: HashMap<Node, HashMap<Node, U256>> = adjacencies
+        .edges
+        .iter()
+        .filter_map(|(from, targets)| {
+            let mut target_map = HashMap::new();
+            for (to, capacity) in targets {
+                if *capacity < edges.get_edge_capacity(from, to).unwrap_or(U256::from(0)) {
+                    target_map.insert(to.clone(), *capacity);
                 }
-            } else {
-                panic!();
             }
-        }
-    }
+            if !target_map.is_empty() {
+                Some((from.clone(), target_map))
+            } else {
+                None
+            }
+        })
+        .collect();
 
     used_edges.retain(|_, out| {
         out.retain(|_, c| *c != U256::from(0));
         !out.is_empty()
     });
 
-    println!("Max flow: {}", flow.to_decimal());
+    println!("Max flow: {}", max_flow.to_decimal());
 
-    if flow > requested_flow {
-        let still_to_prune = prune_flow(source, sink, flow - requested_flow, &mut used_edges);
-        flow = requested_flow + still_to_prune;
+    if max_flow > requested_flow {
+        let still_to_prune = prune_flow(source, sink, max_flow - requested_flow, &mut used_edges);
+        max_flow = requested_flow + still_to_prune;
     }
 
     if let Some(max_transfers) = max_transfers {
@@ -66,19 +61,19 @@ pub fn compute_flow(
             "Capacity lost by transfer count reduction: {}",
             lost.to_decimal_fraction()
         );
-        flow -= lost;
+        max_flow -= lost;
     }
 
-    let transfers = if flow == U256::from(0) {
+    let transfers = if max_flow == U256::from(0) {
         vec![]
     } else {
-        extract_transfers(source, sink, &flow, used_edges)
+        extract_transfers(source, sink, &max_flow, used_edges)
     };
     println!("Num transfers: {}", transfers.len());
     let simplified_transfers = simplify_transfers(transfers);
     println!("After simplification: {}", simplified_transfers.len());
     let sorted_transfers = sort_transfers(simplified_transfers);
-    (flow, sorted_transfers)
+    (max_flow, sorted_transfers)
 }
 
 pub fn transfers_to_dot(edges: &Vec<Edge>) -> String {
@@ -92,6 +87,10 @@ pub fn transfers_to_dot(edges: &Vec<Edge>) -> String {
         capacity,
     } in edges
     {
+        let from_address = node_as_address(from);
+        let to_address = node_as_address(to);
+        let token_address = node_as_address(token);
+
         let t = if token == from {
             "(trust)".to_string()
         } else if token == to {
@@ -427,118 +426,118 @@ fn prune_path(
         }
     }
 }
-
-fn extract_transfers(
-    source: &Address,
-    sink: &Address,
-    amount: &U256,
-    mut used_edges: HashMap<Node, HashMap<Node, U256>>,
-) -> Vec<Edge> {
-    let mut transfers: Vec<Edge> = Vec::new();
-    let mut account_balances: BTreeMap<Address, U256> = BTreeMap::new();
-    account_balances.insert(*source, *amount);
-
-    while !account_balances.is_empty()
-        && (account_balances.len() > 1 || *account_balances.iter().next().unwrap().0 != *sink)
-    {
-        let edge = next_full_capacity_edge(&used_edges, &account_balances);
-        assert!(account_balances[&edge.from] >= edge.capacity);
-        account_balances
-            .entry(edge.from)
-            .and_modify(|balance| *balance -= edge.capacity);
-        *account_balances.entry(edge.to).or_default() += edge.capacity;
-        account_balances.retain(|_account, balance| balance > &mut U256::from(0));
-        assert!(used_edges.contains_key(&Node::BalanceNode(edge.from, edge.token)));
-        used_edges
-            .entry(Node::BalanceNode(edge.from, edge.token))
-            .and_modify(|outgoing| {
-                assert!(outgoing.contains_key(&Node::TrustNode(edge.to, edge.token)));
-                outgoing.remove(&Node::TrustNode(edge.to, edge.token));
-            });
-        transfers.push(edge);
-    }
-
-    transfers
-}
-
-fn next_full_capacity_edge(
-    used_edges: &HashMap<Node, HashMap<Node, U256>>,
-    account_balances: &BTreeMap<Address, U256>,
-) -> Edge {
-    for (account, balance) in account_balances {
-        let edge = used_edges
-            .get(&Node::Node(*account))
-            .map(|v| {
-                v.keys().flat_map(|intermediate| {
-                    used_edges[intermediate]
-                        .iter()
-                        .filter(|(_, capacity)| *balance >= **capacity)
-                        .map(|(trust_node, capacity)| {
-                            let (to, token) = as_trust_node(trust_node);
-                            Edge {
-                                from: *account,
-                                to: *to,
-                                token: *token,
-                                capacity: *capacity,
-                            }
-                        })
-                })
-            })
-            .and_then(|edges| edges.min());
-        if let Some(edge) = edge {
-            return edge;
-        }
-    }
-    panic!();
-}
-
-fn find_pair_to_simplify(transfers: &Vec<Edge>) -> Option<(usize, usize)> {
-    let l = transfers.len();
-    (0..l)
-        .flat_map(move |x| (0..l).map(move |y| (x, y)))
-        .find(|(i, j)| {
-            // We do not need matching capacity, but only then will we save
-            // a transfer.
-            let a = transfers[*i];
-            let b = transfers[*j];
-            *i != *j && a.to == b.from && a.token == b.token && a.capacity == b.capacity
-        })
-}
-
-fn simplify_transfers(mut transfers: Vec<Edge>) -> Vec<Edge> {
-    // We can simplify the transfers:
-    // If we have a transfer (A, B, T) and a transfer (B, C, T),
-    // We can always replace both by (A, C, T).
-
-    while let Some((i, j)) = find_pair_to_simplify(&transfers) {
-        transfers[i].to = transfers[j].to;
-        transfers.remove(j);
-    }
-    transfers
-}
-
-fn sort_transfers(transfers: Vec<Edge>) -> Vec<Edge> {
-    // We have to sort the transfers to satisfy the following condition:
-    // A user can send away their own tokens only after it has received all (trust) transfers.
-
-    let mut receives_to_wait_for: HashMap<Address, u64> = HashMap::new();
-    for e in &transfers {
-        *receives_to_wait_for.entry(e.to).or_default() += 1;
-        receives_to_wait_for.entry(e.from).or_default();
-    }
-    let mut result = Vec::new();
-    let mut queue = transfers.into_iter().collect::<VecDeque<Edge>>();
-    while let Some(e) = queue.pop_front() {
-        //println!("queue size: {}", queue.len());
-        if *receives_to_wait_for.get(&e.from).unwrap() == 0 {
-            *receives_to_wait_for.get_mut(&e.to).unwrap() -= 1;
-            result.push(e)
-        } else {
-            queue.push_back(e);
-        }
-    }
-    result
-}
+//
+// fn extract_transfers(
+//     source: &Address,
+//     sink: &Address,
+//     amount: &U256,
+//     mut used_edges: HashMap<Node, HashMap<Node, U256>>,
+// ) -> Vec<Edge> {
+//     let mut transfers: Vec<Edge> = Vec::new();
+//     let mut account_balances: BTreeMap<Address, U256> = BTreeMap::new();
+//     account_balances.insert(*source, *amount);
+//
+//     while !account_balances.is_empty()
+//         && (account_balances.len() > 1 || *account_balances.iter().next().unwrap().0 != *sink)
+//     {
+//         let edge = next_full_capacity_edge(&used_edges, &account_balances);
+//         assert!(account_balances[&edge.from] >= edge.capacity);
+//         account_balances
+//             .entry(edge.from)
+//             .and_modify(|balance| *balance -= edge.capacity);
+//         *account_balances.entry(edge.to).or_default() += edge.capacity;
+//         account_balances.retain(|_account, balance| balance > &mut U256::from(0));
+//         assert!(used_edges.contains_key(&Node::BalanceNode(edge.from, edge.token)));
+//         used_edges
+//             .entry(Node::BalanceNode(edge.from, edge.token))
+//             .and_modify(|outgoing| {
+//                 assert!(outgoing.contains_key(&Node::TrustNode(edge.to, edge.token)));
+//                 outgoing.remove(&Node::TrustNode(edge.to, edge.token));
+//             });
+//         transfers.push(edge);
+//     }
+//
+//     transfers
+// }
+//
+// fn next_full_capacity_edge(
+//     used_edges: &HashMap<Node, HashMap<Node, U256>>,
+//     account_balances: &BTreeMap<Address, U256>,
+// ) -> Edge {
+//     for (account, balance) in account_balances {
+//         let edge = used_edges
+//             .get(&Node::Node(*account))
+//             .map(|v| {
+//                 v.keys().flat_map(|intermediate| {
+//                     used_edges[intermediate]
+//                         .iter()
+//                         .filter(|(_, capacity)| *balance >= **capacity)
+//                         .map(|(trust_node, capacity)| {
+//                             let (to, token) = as_trust_node(trust_node);
+//                             Edge {
+//                                 from: *account,
+//                                 to: *to,
+//                                 token: *token,
+//                                 capacity: *capacity,
+//                             }
+//                         })
+//                 })
+//             })
+//             .and_then(|edges| edges.min());
+//         if let Some(edge) = edge {
+//             return edge;
+//         }
+//     }
+//     panic!();
+// }
+//
+// fn find_pair_to_simplify(transfers: &Vec<Edge>) -> Option<(usize, usize)> {
+//     let l = transfers.len();
+//     (0..l)
+//         .flat_map(move |x| (0..l).map(move |y| (x, y)))
+//         .find(|(i, j)| {
+//             // We do not need matching capacity, but only then will we save
+//             // a transfer.
+//             let a = transfers[*i];
+//             let b = transfers[*j];
+//             *i != *j && a.to == b.from && a.token == b.token && a.capacity == b.capacity
+//         })
+// }
+//
+// fn simplify_transfers(mut transfers: Vec<Edge>) -> Vec<Edge> {
+//     // We can simplify the transfers:
+//     // If we have a transfer (A, B, T) and a transfer (B, C, T),
+//     // We can always replace both by (A, C, T).
+//
+//     while let Some((i, j)) = find_pair_to_simplify(&transfers) {
+//         transfers[i].to = transfers[j].to;
+//         transfers.remove(j);
+//     }
+//     transfers
+// }
+//
+// fn sort_transfers(transfers: Vec<Edge>) -> Vec<Edge> {
+//     // We have to sort the transfers to satisfy the following condition:
+//     // A user can send away their own tokens only after it has received all (trust) transfers.
+//
+//     let mut receives_to_wait_for: HashMap<Address, u64> = HashMap::new();
+//     for e in &transfers {
+//         *receives_to_wait_for.entry(e.to).or_default() += 1;
+//         receives_to_wait_for.entry(e.from).or_default();
+//     }
+//     let mut result = Vec::new();
+//     let mut queue = transfers.into_iter().collect::<VecDeque<Edge>>();
+//     while let Some(e) = queue.pop_front() {
+//         //println!("queue size: {}", queue.len());
+//         if *receives_to_wait_for.get(&e.from).unwrap() == 0 {
+//             *receives_to_wait_for.get_mut(&e.to).unwrap() -= 1;
+//             result.push(e)
+//         } else {
+//             queue.push_back(e);
+//         }
+//     }
+//     result
+// }
 
 #[cfg(test)]
 mod test {

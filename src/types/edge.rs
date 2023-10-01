@@ -39,6 +39,13 @@ impl<'a> EdgeDB<'a> {
         }
     }
 
+    pub fn get_edge_capacity(&self, from: &Node<'a>, to: &Node<'a>) -> Option<U256> {
+        self.edges
+            .iter()
+            .find(|edge| edge.from == *from && edge.to == *to)
+            .map(|edge| edge.capacity)
+    }
+
     /// Returns an iterator over the edges.
     pub fn iter(&self) -> std::slice::Iter<'_, Edge<'a>> {
         self.edges.iter()

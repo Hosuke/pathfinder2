@@ -5,7 +5,7 @@ use std::cmp::min;
 use std::collections::{HashMap, VecDeque};
 
 pub struct Adjacencies<'a> {
-    edges: HashMap<Node<'a>, HashMap<Node<'a>, U256>>,
+    pub(crate) edges: HashMap<Node<'a>, HashMap<Node<'a>, U256>>,
     level: HashMap<Node<'a>, usize>,
     ptr: HashMap<Node<'a>, usize>,
 }
